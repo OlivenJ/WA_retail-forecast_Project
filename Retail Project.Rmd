@@ -1,0 +1,486 @@
+---
+title: 'ETC3550 S1 2019: Retail Project'
+author: 'Zhiyuan Jiang 28710967'
+output:
+  pdf_document: 
+    toc: true
+    toc_depth: 3
+    number_sections: true
+  html_document: default
+---
+# Data Generation
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, paged.print=FALSE)
+
+library(tidyverse)
+library(fable)
+library(feasts)
+library(tsibble)
+library(tsibbledata)
+library(lubridate)
+
+```
+
+```{r, warning=FALSE}
+set.seed(12345678, sample.kind="Rounding")
+series_picker <-function(id){
+  set.seed(12345678, sample.kind="Rounding")
+myseries <- aus_retail %>%
+  filter(
+    `Series ID` == sample(aus_retail$`Series ID`,1),
+    Month < yearmonth("2018 Jan")
+  )
+}
+
+my_data <- series_picker(28710967) %>% select(Month, Turnover)
+training_set <- my_data[1:405,]
+test_set <- my_data[406:429,]
+
+
+latest_data <- readxl::read_excel("8501011.xlsx", sheet=2, skip=9) %>%
+  rename(Month = `Series ID`) %>%
+  gather(`Series ID`, Turnover, -Month) %>%
+  mutate(Month = yearmonth(Month)) %>%
+  as_tsibble(index=Month,key=`Series ID`) %>% 
+  filter(`Series ID` == "A3349365F", year(Month) > 2017) %>%
+  select(-`Series ID`)
+
+
+```
+
+After generates the data from the function, I subset the data into the training set, which will be used to train the model, and the test set, which will be used to pick the better performance model. 
+
+The training set contains 405 observations, from 04/1982 to 12/2015 while the test set includes the data from 2016 and 2017, 24 observations in total.
+
+Meanwhile, for the final part, we also need the latest data from ABS (2018 Jan -- 2019 March), and we name the data set as "latest_data."
+
+# Statistic features
+
+```{r, fig.pos = 'h'}
+my_data %>% summary()
+my_data %>% glimpse()
+
+my_data %>% autoplot(Turnover) +
+  xlab("Times (quarter)") +
+  ylab("Turnover (Million AUD)") +
+  ggtitle("WA Food's Retail")
+
+my_data %>% gg_tsdisplay(Turnover)+
+  ggtitle("Time series Description")
+
+my_data %>% gg_subseries(Turnover)+
+  ggtitle("Subseries plot to speculate seasonalitu")
+my_data %>% gg_season(Turnover)+
+  ggtitle("Season plot to speculate seasonalitu")
+
+```
+
+```{r,warning=FALSE}
+#STL
+my_decp <-  my_data %>% 
+  model(STL(Turnover ~ season(window = "periodic")) ) %>% 
+  components()
+my_decp %>%  autoplot()
+my_decp %>% gg_subseries(season_year)
+```
+
+The data set in this project is West Australia's cafe, restaurant, and takeaway food service's retail data，
+Time from April 1982 to Dec 2017, 429 observations in total.
+The unit of variable turnover (retail amount) is in \$Million AU.
+$\text{Turnover} \in [17.7, 521.3]$, average turnover is \$A184.2M
+
+From the graph, the turnover's amount shows a very obvious increasing trend, with the trend slowing down (damped) from the year 2012 to the year 2016. Then the growth comes back.
+The ACF plot indicates that the data set has very strong autocorrelation, so it is non-stationary or trend stationary.
+
+From the seasonal prospect, the plot shows that the Turnover amount will peak in December, probably due to the Chrismas holiday, and then touch the bottom in the next year's February. So a seasonal pattern exist.
+
+For further information, I also use the STL decompose method to investigate the seasonal pattern in depth.
+The data touches the bottom in February, gradually climb up and finally climax in December.
+
+# Data Preparation
+
+## Transformation 
+
+Since the variance of the data set is not unified (by observing the plot), a transformation will be necessary.
+And from the above discussion, the data is non-stationary, so the mean of the data need stables as well.
+```{r, fig.pos = 'h'}
+my_data %>% autoplot(log(Turnover))
+my_data %>% features(Turnover, feature = guerrero)
+
+my_data %>% autoplot(
+  box_cox(Turnover, 0.3)
+) + xlab("Time (Month)")+
+  ylab("Turnover (After Box Cox transformation)") +
+  ggtitle("WA food retial (After transformation)")
+```
+
+From the plot, the log transformation over correct the variance problem a little bit. Part of the plot looks convex. 
+
+Using the Guerrero method, the algorithm report $\lambda = 0.263$. 
+
+For simplicity, this project uses $\lambda = 0.3$ to transform the data, and the result is showing in the last graph.
+
+## Differencing 
+
+```{r, warning=FALSE, fig.pos = 'h'}
+
+
+my_data %>% gg_tsdisplay(box_cox(Turnover, 0.3))
+my_data %>% gg_tsdisplay(difference(box_cox(Turnover, 0.3)))+
+  ggtitle("First difference") +
+  ylab("Difference y")
+```
+
+To stable the data, differences are necessary.
+From the first order difference, the data seems stationary, but ACF plot indicates a seasonal pattern still exists. With perk comes back after lag 12, and repeat at lag 24.
+
+```{r, warning = FALSE, fig.pos = 'h'}
+my_data %>% gg_tsdisplay(difference(box_cox(Turnover, 0.3), lag = 12))+
+  ggtitle("Seasonal Difference") +
+  ylab("Difference y")
+```
+
+If only apply seasonal difference, the data is still non-stational, so a step further second-order difference is required.
+
+```{r, warning=FALSE, fig.pos='h'}
+my_data %>% gg_tsdisplay(difference(box_cox(Turnover, 0.3), lag = 12) %>%
+                           difference()) +
+  ggtitle("Two Steps Difference") +
+  ylab("Difference y")
+```
+
+With two times of difference, the plot seems stationary.
+
+```{r, warning=FALSE, fig.pos='h'}
+my_data %>%
+  mutate(trans = box_cox(Turnover, 0.3)) %>%
+  features(trans, unitroot_kpss)
+
+my_data %>% 
+  mutate(fir_diff = 
+           difference( box_cox(Turnover, 0.3) )
+         ) %>%
+  features(fir_diff, unitroot_kpss)
+
+my_data %>% 
+  mutate(fir_diff = 
+           difference( box_cox(Turnover, 0.3) , lag = 12)
+         ) %>%
+  features(fir_diff, unitroot_kpss)
+
+my_data %>% 
+  mutate(fist_diff = difference(box_cox(Turnover, 0.3)) %>% difference()) %>% 
+  features(fist_diff, unitroot_kpss)
+
+```
+
+The KPSS test (Unit root) test, shows an extremely small p-value (0.01) for no difference data, indicates that it exists unit root.
+
+But after difference (include first difference, seasonal difference, and two steps difference), the data shows no unit root exists. So we could fit the model with the after difference data without concerns.
+
+
+# Modelling 
+## ARIMA
+### Model Selecting
+After two times difference, the ACF plot reports a pike at lag 1, indicate a non-seasonal MA(1), and a pike at lag12 indicate a seasonal MA(1)
+
+From the PACF plot, the lag1 and lag2 are both over the lower bound of the confidence level, indicate a non-seasonal AR(2), the same pattern observed at lag12 and lag13, which means a seasonal AR(2)
+
+So the potential models are:
+
+**ARIMA(0,1,1)(0,1,1)[12]** 
+
+**ARIMA(2,1,0)(2,1,0)[12]**
+
+I also plan to fit a complete ARIMA model with both the AR part and the MA part like:
+
+**ARIMA(2,1,1)(2,1,1)[12]**
+
+Clearly, from the plot, the data shows no quadratic pattern, so since the model already have two difference, no constant needed in all those models.
+
+I also ask the algorithm to automatically pick a model.
+
+### Model Building
+```{r, fig.pos = 'h'}
+arima_fit <- training_set %>% model(
+  ar = ARIMA(box_cox(Turnover, 0.3) ~ pdq(2,1,0) + PDQ(2,1,0)),
+  ma = ARIMA(box_cox(Turnover, 0.3) ~ pdq(0,1,1) + PDQ(0,1,1)),
+  arima = ARIMA(box_cox(Turnover,0.3) ~ pdq(2,1,1) + PDQ(2,1,1)),
+  auto = ARIMA(box_cox(Turnover, 0.3), stepwise = FALSE)
+) 
+
+arima_fit %>% select("auto") %>%
+  report()
+```
+
+The automatic select model is an ARIMA(1,0,1)(0,1,1)[12] model.
+
+I select the model from the following procedures:
+
+```{r, fig.pos = 'h'}
+arima_fit %>% glance()
+```
+
+1. The AIC/AICc criteria, I found that the MA, ARIMA, and automatically select ARIMA(1,0,1)(0,1,1)[12] with the constant model all perform reasonably well. But, worth to notice, the auto model has different difference term, so here compare its AICc with other model is not fair. 
+
+```{r, fig.pos='h'}
+for_arima <- arima_fit %>% forecast(h = "2 years") %>%
+  select(.model, Month, Turnover, .mean)
+```
+
+2. From the forecast plot, I get consistent conclusion with the previous step.  Although because the auto select model has only one difference term, it has smaller forecasting interval.
+
+```{r, fig.pos = 'h'}
+for_arima %>%
+  autoplot(my_data %>% filter(year(Month) > 2012)) +
+  facet_wrap(~.model)+
+  xlab("Time")+
+  ggtitle("Forecasitn results of four ARIMA models")
+
+for_arima %>% accuracy(test_set)
+```
+
+3. Compare the forecasting result with the training set data, the best perform a model (with the smallest RMSE, MPE and MAPE) is the arima model, then is the ma model. So, the ARIMA(2,1,1)(2,1,1)[12] model becomes the final winner of ARIMA section.
+## ETS 
+
+### Model Selecting
+Then I want to find the best one in the ETC regime
+From the previous plot, the data behave an upward linear trend, with a little damp after 2012. However, the increase continues afterward, so the damped term is not considered in this model
+.
+The seasonality is not apparent, so an Additive seasonal term may more than appropriate.
+
+The candidate model is as follow
+
+**ETS(M,A,A)**
+
+**ETS(M,M,A)**
+
+**ETS(A,A,A)**
+
+**ETS(A,M,A)**
+
+Automatic select model is also in consideration.
+
+### Model Building
+```{r}
+ets_fit <- training_set %>%
+  model(
+    MAA = ETS(box_cox(Turnover, 0.3) ~ error("M") + trend("A") + season("A")),
+    MMA = ETS(box_cox(Turnover, 0.3) ~ error("M") + trend("M") + season("A")),
+    AAA = ETS(box_cox(Turnover, 0.3) ~ error("A") + trend("A") + season("A")),
+    AMA = ETS(box_cox(Turnover, 0.3) ~ error("A") + trend("M") + season("A")),
+    auto = ETS(box_cox(Turnover, 0.3))
+  )
+
+ets_fit %>% select("auto") %>% 
+  report()
+```
+
+The algorithm picks an ETS(AAA) model, which is already on the list.
+
+From the long list, the same method applied to pick the winner.
+
+```{r}
+
+#ets_fit %>% select("AAA") %>%
+ # forecast(h = "2 years") %>%
+#  autoplot(my_data %>% filter(year(Month) > 2012))
+
+ets_fit %>% glance()
+```
+
+1. The AIC/AICc indicates the  AAA model (so as the auto select model) has the best perofrmances, then is the AMA model.
+
+```{r}
+for_ets <-ets_fit %>% forecast(h = "2 years")
+
+#for_ets %>%
+#  autoplot(my_data %>% filter(year(Month) > 2012)) +
+#  facet_wrap(~.model)+
+#  xlab("Time")+
+#  ggtitle("Forecasitn results of four ETS models")
+
+
+for_ets %>% accuracy(test_set)
+```
+
+2. Because it contains a multiplicative trend term in the model, the forecast of AMA performs very poorly. The last winner of the ETS regime is the ETS(AAA) model.
+
+```{r}
+ETS_AAA <- ets_fit %>% select("AAA")
+ARIMA <- arima_fit %>% select("arima")
+```
+
+# Final Comparison
+
+## Estimate result
+
+```{r}
+report(ETS_AAA)
+
+report(ARIMA)
+```
+
+The ETS(AAA) model need to estimate three parameters and to specific 14 start values
+
+The ARIMA model has six parameters wait to estimate.
+
+## Forecast result compare
+```{r, fig.pos = 'h'}
+ets_for <- ETS_AAA %>% forecast( h = "2 years")
+arima_for <- ARIMA %>% forecast(h = "2 years")
+
+
+ets_for %>% autoplot(test_set) +
+  xlab("Times") +
+  ylab("Turnover") +
+  ggtitle("Forecasting reuslt of ETS model") 
+
+
+arima_for %>% autoplot(test_set)+
+  xlab("Times") +
+  ylab("Turnover") +
+  ggtitle("Forecasting reuslt of ARIMA model")
+
+ets_for %>% accuracy(test_set)
+arima_for %>% accuracy(test_set)
+```
+
+From the forecasting plot, the result seems fairly similar, and we could not determine which one is better just from the plot.
+
+However, it's quite obvious that, from the accuracy statistic result, the ETS(AAA) model's forecasting is more accurate since it has smaller RMSE, MAE, MPE, and all other statistics.
+
+## Residual diagnostic 
+```{r, fig.pos = 'h'}
+ETS_AAA %>% augment() %>% 
+  gg_tsdisplay(.resid, "hist") +
+  ggtitle("Residual Diagnostic of ETS model")
+ARIMA %>% augment() %>% 
+  gg_tsdisplay(.resid, "hist")+
+  ggtitle("Residual Diagnostic of ARIMA model")
+
+Box.test(augment(ETS_AAA)$.resid, fitdf = 16, lag = 24, type = "Ljung")
+Box.test(augment(ARIMA)$.resid, fitdf = 6 , lag = 24, type = "Ljung")
+```
+
+The final step to determine the best model is residual diagnostic.
+
+Unfortunately, the residual of the ETS(AAA) model does not act very "White noise." The ACF plot shows perk close to, or break the boundary several times at lag 8, lag 14, lag 15 and lag 18.
+
+While the ARIMA has better behave residual. Besides the lag 14, no one break through the limit. The only perk may due to the 5% possibility. Residual's histogram is more normal-ish than the ETS one.
+
+So, I decided to pick the **ARIMA(2,1,0)(2,1,0)[12]** model as the best one.
+
+# Compare with the latest real data
+
+Now, I will use all the data I have to estimate an ARIMA(2,1,1)(2,1,1)[12] model and ask it to forecast the next two years Western Australia's food retail turnover rate. Then compare the estimated result with the real data from ABS, which for now, only provides data to March 2019.
+
+```{r, fig.pos = 'h'}
+for_19 <- my_data %>% model(
+ arima = ARIMA(box_cox(Turnover,0.3) ~ pdq(2,1,1) + PDQ(2,1,1)) 
+) %>% forecast(h = "2 years")
+
+for_21 <- my_data %>% model(
+  arima = ARIMA(box_cox(Turnover, 0.3) ~ pdq(2,1,1) + PDQ(2,1,1))
+) %>% forecast(h = "4 years")
+
+for_19 %>% autoplot(latest_data)+
+  xlab("Time")+
+  ylab("Turnover") +
+  ggtitle("Two Years Forecasting of ARIMA(2,1,1)(2,1,1)[12], compare with ture value")
+
+for_21 %>% autoplot(latest_data)+
+  xlab("Time")+
+  ylab("Turnover") +
+  ggtitle("Four Years Forecasting of ARIMA(2,1,1)(2,1,1)[12], compare with ture value")
+
+#for_19 %>% mutate(interavl = hilo(.mean, 80))
+```
+
+Comparing the forecast result with the true data, the result is pretty good.
+
+Most of the forecasting value falls into the 80% forecast interval, and all of them are in the 95% interval. The basic pattern from the forecasting is correct.
+
+```{r, fig.pos = 'h'}
+for_19_ets <- my_data %>% model(
+ arima = ETS(box_cox(Turnover,0.3) ~ error("A") + trend("A") + season("A")) 
+) %>% forecast(h = 24)
+
+for_21_ets <- my_data %>% model(
+  arima = ETS(box_cox(Turnover, 0.3) ~ error("A") + trend("A") + season("A"))
+) %>% forecast(h = 48)
+
+for_19_ets %>% autoplot(latest_data)+
+  xlab("Time")+
+  ylab("Turnover") +
+  ggtitle("Two Years Forecasting of ETS(AAA), compare with ture value")
+
+for_21_ets %>% autoplot(latest_data)+
+  xlab("Time")+
+  ylab("Turnover") +
+  ggtitle("Four Years Forecasting of ETS(AAA), compare with ture value")
+
+#for_19_ets %>% mutate(interavl = hilo(.distribution, 80))
+```
+
+```{r, fig.pos = 'h'}
+for_19_auto <- my_data %>% model(
+ arima = ARIMA(box_cox(Turnover,0.3) ~ pdq(1,0,1) + PDQ(0,1,1)) 
+) %>% forecast(h = 24)
+
+for_21_auto <- my_data %>% model(
+  arima = ARIMA(box_cox(Turnover, 0.3) ~ pdq(1,0,1) + PDQ(0, 1,1))
+) %>% forecast(h = 48)
+
+
+for_19_auto %>% autoplot(latest_data)+
+  xlab("Time")+
+  ylab("Turnover") +
+  ggtitle("Two Years Forecasting of ARIMA(1,0,1)(0,1,1)[12], compare with the ture value")
+
+for_21_auto %>% autoplot(latest_data)+
+  xlab("Time")+
+  ylab("Turnover") +
+  ggtitle("Four Years Forecasting of ARIMA(1,0,1)(0,1,1)[12], compare with the ture value")
+#for_19_auto %>% mutate(interavl = hilo(.distribution, 80))
+```
+
+For personal interest, I also use the ETS(AAA) and the automatic select ARIMA(1,0,1)(0,1,1)[12] model to forecast the result.
+
+Most of ETS(AAA) model's forecasting result is not falls into the 80% interval; some of them are not even in the 95% interval. You are indicating that this result is not very helpful in regards with the forecasting. 
+
+But, the ARIMA(1,0,1)(0,1,1)[12] (automatic select one) model outbeat my ARIMA(2,1,1)(2,1,1)[12]. With almost mimic reality performance. All the forecast result are in the 80% forecast interval, regards the fact that the test set result from this model is not the best one.
+
+```{r, fig.pos = 'h'}
+
+for_19 %>% accuracy(latest_data)
+for_19_ets %>% accuracy(latest_data)
+for_19_auto %>% accuracy(latest_data)
+
+for_21 %>% accuracy(latest_data)
+for_21_ets %>% accuracy(latest_data)
+for_21_auto %>% accuracy(latest_data)
+
+```
+
+Compare all the accuracy statistics, the automatic select model, without any surprise, has the best performance. 
+
+# afterthought
+
+Overall, the final winner's performance is well. 
+
+1. The forecasting gives correct pattern
+
+2. The forecast interval is reasonable and useful.
+
+However, there are still several points that could be improved or modified:
+
+1. The parameter involved in the model is too many, to regress the final ARIMA model, we need to estimate eight parameters.
+
+2. The term of difference in this model is two, which means that the forecasting interval is extended by the additional difference term. And from the plot, it could be found that the two difference term forecasting interval is a little bit larger than the one-term interval.
+
+3. Compare with the automatic one, the ARIMA(2,1,1)(2,1,1) model is still a bit disappointing. Suggest that, different data set will suggest a different model. The best one from the learning set may not be the best one used in the real forecasting task.
+
+4. Due to the nature of the ARIMA model, the forecasting interval will become larger and larger with the forecasting goes further. Means that for the long-term forecast, this model will not be practical.
+
+5. From the STL decomposition plot, I found that the data has a significant change in more recent time, which means that the data has structure break. So in the real work, we may consider using a different model to fit different data. Or we could only use the recent data to fit the model.
